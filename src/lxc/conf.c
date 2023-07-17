@@ -50,6 +50,7 @@
 #include "mount_utils.h"
 #include "namespace.h"
 #include "network.h"
+#include "open_utils.h"
 #include "parse.h"
 #include "process_utils.h"
 #include "ringbuf.h"
@@ -922,29 +923,29 @@ static int lxc_setup_dev_symlinks(const struct lxc_rootfs *rootfs)
 }
 
 /* Build a space-separate list of ptys to pass to systemd. */
-static bool append_ttyname(char **pp, char *name)
+static bool append_ttyname(struct lxc_tty_info *ttys, char *tty_name)
 {
-	char *p;
+	char *tty_names, *buf;
 	size_t size;
 
-	if (!*pp) {
-		*pp = zalloc(strlen(name) + strlen("container_ttys=") + 1);
-		if (!*pp)
-			return false;
-
-		sprintf(*pp, "container_ttys=%s", name);
-		return true;
-	}
-
-	size = strlen(*pp) + strlen(name) + 2;
-	p = realloc(*pp, size);
-	if (!p)
+	if (!tty_name)
 		return false;
 
-	*pp = p;
-	(void)strlcat(p, " ", size);
-	(void)strlcat(p, name, size);
+	size = strlen(tty_name) + 1;
+	if (ttys->tty_names)
+		size += strlen(ttys->tty_names) + 1;
 
+	buf = realloc(ttys->tty_names, size);
+	if (!buf)
+		return false;
+	tty_names = buf;
+
+	if (ttys->tty_names)
+		(void)strlcat(buf, " ", size);
+	else
+		buf[0] = '\0';
+	(void)strlcat(buf, tty_name, size);
+	ttys->tty_names = tty_names;
 	return true;
 }
 
@@ -957,7 +958,7 @@ static int open_ttymnt_at(int dfd, const char *path)
 		     PROTECT_LOOKUP_BENEATH,
 		     0);
 	if (fd < 0) {
-		if (!IN_SET(errno, ENXIO, EEXIST))
+		if (errno != ENXIO && errno != EEXIST)
 			return syserror("Failed to create \"%d/\%s\"", dfd, path);
 
 		SYSINFO("Failed to create \"%d/\%s\"", dfd, path);
@@ -1065,7 +1066,7 @@ static int lxc_setup_ttys(struct lxc_conf *conf)
 			DEBUG("Bind mounted \"%s\" onto \"%s\"", tty->name, rootfs->buf);
 		}
 
-		if (!append_ttyname(&conf->ttys.tty_names, tty->name))
+		if (!append_ttyname(&conf->ttys, tty->name))
 			return log_error(-1, "Error setting up container_ttys string");
 	}
 
@@ -1605,8 +1606,11 @@ static int lxc_pivot_root(const struct lxc_rootfs *rootfs)
 		return log_error_errno(-errno, errno, "Failed to enter old root directory");
 
 	/*
-	 * Make fd_oldroot a depedent mount to make sure our umounts don't
-	 * propagate to the host.
+	 * Unprivileged containers will have had all their mounts turned into
+	 * dependent mounts when the container was created. But for privileged
+	 * containers we need to turn the old root mount tree into a dependent
+	 * mount tree to prevent propagating mounts and umounts into the host
+	 * mount namespace.
 	 */
 	ret = mount("", ".", "", MS_SLAVE | MS_REC, NULL);
 	if (ret < 0)
@@ -1619,6 +1623,31 @@ static int lxc_pivot_root(const struct lxc_rootfs *rootfs)
 	ret = fchdir(rootfs->dfd_mnt);
 	if (ret < 0)
 		return log_error_errno(-errno, errno, "Failed to re-enter new root directory \"%s\"", rootfs->mount);
+
+	/*
+	 * Finally, we turn the rootfs into a shared mount. Note, that this
+	 * doesn't reestablish mount propagation with the hosts mount
+	 * namespace. Instead we'll create a new peer group.
+	 *
+	 * We're doing this because most workloads do rely on the rootfs being
+	 * a shared mount. For example, systemd daemon like sytemd-udevd run in
+	 * their own mount namespace. Their mount namespace has been made a
+	 * dependent mount (MS_SLAVE) with the host rootfs as it's dominating
+	 * mount. This means new mounts on the host propagate into the
+	 * respective services.
+	 *
+	 * This is broken if we leave the container's rootfs a dependent mount.
+	 * In which case both the container's rootfs and the service's rootfs
+	 * will be dependent mounts with the host's rootfs as their dominating
+	 * mount. So if you were to mount over the rootfs from the host it
+	 * would not just propagate into the container's mount namespace it
+	 * would also propagate into the service. That's nonsense semantics for
+	 * nearly all relevant use-cases. Instead, establish the container's
+	 * rootfs as a separate peer group mirroring the behavior on the host.
+	 */
+	ret = mount("", ".", "", MS_SHARED | MS_REC, NULL);
+	if (ret < 0)
+		return log_error_errno(-errno, errno, "Failed to turn new root mount tree into shared mount tree");
 
 	TRACE("Changed into new rootfs \"%s\"", rootfs->mount);
 	return 0;
@@ -2183,7 +2212,7 @@ static int lxc_setup_console(const struct lxc_handler *handler,
 
 static int parse_mntopt(char *opt, unsigned long *flags, char **data, size_t size)
 {
-	ssize_t ret;
+	size_t ret;
 
 	/* If '=' is contained in opt, the option must go into data. */
 	if (!strchr(opt, '=')) {
@@ -2207,12 +2236,12 @@ static int parse_mntopt(char *opt, unsigned long *flags, char **data, size_t siz
 
 	if (strlen(*data)) {
 		ret = strlcat(*data, ",", size);
-		if (ret < 0)
+		if (ret >= size)
 			return log_error_errno(ret, errno, "Failed to append \",\" to %s", *data);
 	}
 
 	ret = strlcat(*data, opt, size);
-	if (ret < 0)
+	if (ret >= size)
 		return log_error_errno(ret, errno, "Failed to append \"%s\" to %s", opt, *data);
 
 	return 0;
@@ -2568,7 +2597,7 @@ static int mount_entry_create_dir_file(const struct mntent *mntent,
 	}
 
 	if (hasmntopt(mntent, "create=dir")) {
-		ret = mkdir_p(path, 0755);
+		ret = lxc_mkdir_p(path, 0755);
 		if (ret < 0 && errno != EEXIST)
 			return log_error_errno(-1, errno, "Failed to create directory \"%s\"", path);
 	}
@@ -2586,7 +2615,7 @@ static int mount_entry_create_dir_file(const struct mntent *mntent,
 
 	p2 = dirname(p1);
 
-	ret = mkdir_p(p2, 0755);
+	ret = lxc_mkdir_p(p2, 0755);
 	if (ret < 0 && errno != EEXIST)
 		return log_error_errno(-1, errno, "Failed to create directory \"%s\"", path);
 
@@ -2885,7 +2914,7 @@ static int __lxc_idmapped_mounts_child(struct lxc_handler *handler, FILE *f)
 		struct lxc_mount_options opts = {};
 		int dfd_from;
 		const char *source_relative, *target_relative;
-		struct lxc_mount_attr attr = {};
+		struct mount_attr attr = {};
 
 		ret = parse_lxc_mount_attrs(&opts, mntent.mnt_opts);
 		if (ret < 0)
@@ -3005,7 +3034,7 @@ static int __lxc_idmapped_mounts_child(struct lxc_handler *handler, FILE *f)
 
 		/* Set propagation mount options. */
 		if (opts.attr.propagation) {
-			attr = (struct lxc_mount_attr) {
+			attr = (struct mount_attr) {
 				.propagation = opts.attr.propagation,
 			};
 
@@ -3040,7 +3069,7 @@ static int __lxc_idmapped_mounts_child(struct lxc_handler *handler, FILE *f)
 			dfd_from = rootfs->dfd_mnt;
 		else
 			dfd_from = rootfs->dfd_host;
-		fd_to = open_at(dfd_from, target_relative, PROTECT_OPATH_FILE, PROTECT_LOOKUP_BENEATH_WITH_SYMLINKS, 0);
+		fd_to = open_at(dfd_from, target_relative, PROTECT_OPATH_FILE, PROTECT_LOOKUP_BENEATH_XDEV, 0);
 		if (fd_to < 0) {
 			if (opts.optional) {
 				TRACE("Skipping optional idmapped mount");
@@ -4109,7 +4138,7 @@ int lxc_idmapped_mounts_parent(struct lxc_handler *handler)
 
 	for (;;) {
 		__do_close int fd_from = -EBADF, fd_userns = -EBADF;
-		struct lxc_mount_attr attr = {};
+		struct mount_attr attr = {};
 		struct lxc_mount_options opts = {};
 		ssize_t ret;
 
@@ -4120,7 +4149,7 @@ int lxc_idmapped_mounts_parent(struct lxc_handler *handler)
 			return syserror("Failed to receive idmapped mount file descriptors from child");
 
 		if (fd_from < 0 || fd_userns < 0)
-			return log_trace(0, "Finished receiving idmapped mount file descriptors from child");
+			return log_trace(0, "Finished receiving idmapped mount file descriptors (%d | %d) from child", fd_from, fd_userns);
 
 		attr.attr_set	= MOUNT_ATTR_IDMAP;
 		attr.userns_fd	= fd_userns;
@@ -4316,6 +4345,14 @@ static int setup_capabilities(struct lxc_conf *conf)
 	return 0;
 }
 
+static int make_shmount_dependent_mount(const struct lxc_conf *conf)
+{
+	if (!(conf->auto_mounts & LXC_AUTO_SHMOUNTS_MASK))
+		return 0;
+
+	return mount(NULL, conf->shmount.path_cont, NULL, MS_REC | MS_SLAVE, 0);
+}
+
 int lxc_setup(struct lxc_handler *handler)
 {
 	int ret;
@@ -4444,6 +4481,11 @@ int lxc_setup(struct lxc_handler *handler)
 	ret = lxc_setup_rootfs_switch_root(&lxc_conf->rootfs);
 	if (ret < 0)
 		return log_error(-1, "Failed to pivot root into rootfs");
+
+	ret = make_shmount_dependent_mount(lxc_conf);
+	if (ret < 0)
+		return log_error(-1, "Failed to turn mount tunnel \"%s\" into dependent mount",
+				 lxc_conf->shmount.path_cont);
 
 	/* Setting the boot-id is best-effort for now. */
 	if (lxc_conf->autodev > 0)
@@ -4831,6 +4873,7 @@ void lxc_conf_free(struct lxc_conf *conf)
 	free(conf->cgroup_meta.container_dir);
 	free(conf->cgroup_meta.namespace_dir);
 	free(conf->cgroup_meta.controllers);
+	free(conf->cgroup_meta.systemd_scope);
 	free(conf->shmount.path_host);
 	free(conf->shmount.path_cont);
 	free(conf);

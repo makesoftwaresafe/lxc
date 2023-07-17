@@ -21,6 +21,7 @@
 #include "list.h"
 #include "lxcseccomp.h"
 #include "memory_utils.h"
+#include "mount_utils.h"
 #include "namespace.h"
 #include "ringbuf.h"
 #include "start.h"
@@ -74,6 +75,13 @@ struct lxc_cgroup {
 			char *container_dir;
 			char *namespace_dir;
 			bool relative;
+			/* If an unpriv user in pure unified-only hierarchy
+			 * starts a container, then we ask systemd to create
+			 * a scope for us, and create the monitor and container
+			 * cgroups under that.
+			 * This will ignore the above things like monitor_dir
+			 */
+			char *systemd_scope;
 		};
 	};
 
@@ -216,7 +224,7 @@ struct lxc_mount_options {
 	unsigned long mnt_flags;
 	unsigned long prop_flags;
 	char *data;
-	struct lxc_mount_attr attr;
+	struct mount_attr attr;
 	char *raw_options;
 };
 
@@ -225,7 +233,7 @@ struct lxc_mount_options {
  * @path         : the rootfs source (directory or device)
  * @mount        : where it is mounted
  * @buf		 : static buffer to construct paths
- * @bev_type     : optional backing store type
+ * @bdev_type     : optional backing store type
  * @managed      : whether it is managed by LXC
  * @dfd_mnt	 : fd for @mount
  * @dfd_dev : fd for /dev of the container

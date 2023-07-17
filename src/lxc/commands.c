@@ -89,6 +89,7 @@ static const char *lxc_cmd_str(lxc_cmd_t cmd)
 		[LXC_CMD_GET_CGROUP_CTX]		= "get_cgroup_ctx",
 		[LXC_CMD_GET_CGROUP_FD]			= "get_cgroup_fd",
 		[LXC_CMD_GET_LIMIT_CGROUP_FD]		= "get_limit_cgroup_fd",
+		[LXC_CMD_GET_SYSTEMD_SCOPE]		= "get_systemd_scope",
 	};
 
 	if (cmd >= LXC_CMD_MAX)
@@ -507,7 +508,7 @@ static ssize_t lxc_cmd(const char *name, struct lxc_cmd_rr *cmd, bool *stopped,
 
 	client_fd = lxc_cmd_send(name, cmd, lxcpath, hashed_sock_name);
 	if (client_fd < 0) {
-		if (IN_SET(errno, ECONNREFUSED, EPIPE))
+		if (errno == ECONNREFUSED || errno == EPIPE)
 			*stopped = 1;
 
 		return systrace("Command \"%s\" failed to connect command socket", lxc_cmd_str(cmd->req.cmd));
@@ -1316,6 +1317,55 @@ static int lxc_cmd_get_lxcpath_callback(int fd, struct lxc_cmd_req *req,
 	return lxc_cmd_rsp_send_reap(fd, &rsp);
 }
 
+char *lxc_cmd_get_systemd_scope(const char *name, const char *lxcpath)
+{
+	bool stopped = false;
+	ssize_t ret;
+	struct lxc_cmd_rr cmd;
+
+	lxc_cmd_init(&cmd, LXC_CMD_GET_SYSTEMD_SCOPE);
+
+	ret = lxc_cmd(name, &cmd, &stopped, lxcpath, NULL);
+	if (ret < 0)
+		return NULL;
+
+	if (cmd.rsp.ret == 0)
+		return cmd.rsp.data;
+
+	return NULL;
+}
+
+static int lxc_cmd_get_systemd_scope_callback(int fd, struct lxc_cmd_req *req,
+					     struct lxc_handler *handler,
+					     struct lxc_async_descr *descr)
+{
+	__do_free char *scope = NULL;
+	struct lxc_cmd_rsp rsp = {
+		.ret = -EINVAL,
+	};
+
+	// cgroup_meta.systemd_scope is the full cgroup path to the scope.
+	// The caller just wants the actual scope name, that is, basename().
+	// (XXX - or do we want the caller to massage it?  I'm undecided)
+	if (handler->conf->cgroup_meta.systemd_scope) {
+		scope = strrchr(handler->conf->cgroup_meta.systemd_scope, '/');
+		if (scope && *scope)
+			scope++;
+		if (scope && *scope)
+			scope = strdup(scope);
+	}
+
+	if (!scope)
+		goto out;
+
+	rsp.ret = 0;
+	rsp.data = scope;
+	rsp.datalen = strlen(scope) + 1;
+
+out:
+	return lxc_cmd_rsp_send_reap(fd, &rsp);
+}
+
 int lxc_cmd_add_state_client(const char *name, const char *lxcpath,
 			     lxc_state_t states[static MAX_STATE],
 			     int *state_client_fd)
@@ -1900,6 +1950,7 @@ static int lxc_cmd_process(int fd, struct lxc_cmd_req *req,
 		[LXC_CMD_GET_CGROUP_CTX]		= lxc_cmd_get_cgroup_ctx_callback,
 		[LXC_CMD_GET_CGROUP_FD]			= lxc_cmd_get_cgroup_fd_callback,
 		[LXC_CMD_GET_LIMIT_CGROUP_FD]		= lxc_cmd_get_limit_cgroup_fd_callback,
+		[LXC_CMD_GET_SYSTEMD_SCOPE]		= lxc_cmd_get_systemd_scope_callback,
 	};
 
 	if (req->cmd >= LXC_CMD_MAX)
@@ -2029,13 +2080,9 @@ static int lxc_cmd_accept(int fd, uint32_t events, void *data,
 	__do_close int connection = -EBADF;
 	int opt = 1, ret = -1;
 
-	connection = accept(fd, NULL, 0);
+	connection = accept4(fd, NULL, 0, SOCK_CLOEXEC);
 	if (connection < 0)
 		return log_error_errno(LXC_MAINLOOP_ERROR, errno, "Failed to accept connection to run command");
-
-	ret = fcntl(connection, F_SETFD, FD_CLOEXEC);
-	if (ret < 0)
-		return log_error_errno(ret, errno, "Failed to set close-on-exec on incoming command connection");
 
 	ret = setsockopt(connection, SOL_SOCKET, SO_PASSCRED, &opt, sizeof(opt));
 	if (ret < 0)
@@ -2070,10 +2117,6 @@ int lxc_server_init(const char *name, const char *lxcpath, const char *suffix)
 
 		return log_error_errno(-1, errno, "Failed to create command socket %s", &path[1]);
 	}
-
-	ret = fcntl(fd, F_SETFD, FD_CLOEXEC);
-	if (ret < 0)
-		return log_error_errno(-1, errno, "Failed to set FD_CLOEXEC on command socket file descriptor");
 
 	return log_trace(move_fd(fd), "Created abstract unix socket \"%s\"", &path[1]);
 }

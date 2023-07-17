@@ -142,7 +142,8 @@ static int parse_mntsubopts(char *subopts, char *const *keys,
 static int parse_bind_mnt(char *mntstring, enum mnttype type);
 static int parse_ovl_mnt(char *mntstring, enum mnttype type);
 
-int main(int argc, char *argv[])
+int __attribute__((weak, alias("lxc_copy_main"))) main(int argc, char *argv[]);
+int lxc_copy_main(int argc, char *argv[])
 {
 	struct lxc_container *c;
 	struct lxc_log log;
@@ -358,7 +359,7 @@ static char *set_mnt_entry(struct mnts *m)
 			goto err;
 	} else if (m->mnt_type == LXC_MNT_BIND) {
 		len = strlen("  none bind,optional,, 0 0") +
-		      strlen(is_dir(m->src) ? "create=dir" : "create=file") +
+		      strlen(lxc_is_dir(m->src) ? "create=dir" : "create=file") +
 		      strlen(m->src) + strlen(m->dest) + strlen(m->options) + 1;
 
 		mntentry = malloc(len);
@@ -367,7 +368,7 @@ static char *set_mnt_entry(struct mnts *m)
 
 		ret = snprintf(mntentry, len, "%s %s none bind,optional,%s,%s 0 0",
 				m->src,	m->dest, m->options,
-				is_dir(m->src) ? "create=dir" : "create=file");
+				lxc_is_dir(m->src) ? "create=dir" : "create=file");
 		if (ret < 0 || (size_t)ret >= len)
 			goto err;
 	}

@@ -38,7 +38,7 @@ lxc-destroy destroys a container with the identifier NAME\n\
 Options :\n\
   -n, --name=NAME   NAME of the container\n\
   -s, --snapshots   destroy including all snapshots\n\
-  -f, --force       wait for the container to shut down\n\
+  -f, --force       stop and destroy the container if it's still running\n\
   --rcfile=FILE     Load configuration file FILE\n",
 	.options      = my_longopts,
 	.parser       = my_parser,
@@ -188,7 +188,8 @@ static bool do_destroy_with_snapshots(struct lxc_container *c)
 	return bret;
 }
 
-int main(int argc, char *argv[])
+int __attribute__((weak, alias("lxc_destroy_main"))) main(int argc, char *argv[]);
+int lxc_destroy_main(int argc, char *argv[])
 {
 	struct lxc_container *c;
 	struct lxc_log log;
